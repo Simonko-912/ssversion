@@ -1,6 +1,11 @@
-// ssversion: dump the SystemUpdate ssversion SystemSaveData (id 0x49,
+// ssversion: dump the SystemUpdate ssversion SystemSaveData (id ...49,
 // ns_ssversion:/entry) as hex + parsed fields.
 // Builds for Switch 1 (libnx) and Switch 2 (libounce) from this one file.
+//
+// Strategy: enumerate SystemSaveData records with the save-info reader,
+// print every record, then open the matching one with EXACTLY the
+// attributes the reader returned (fsp-srv on Switch 1 matches every
+// nonzero filter field, so hand-built attributes are unreliable).
 
 #include <stdio.h>
 #include <string.h>
@@ -8,7 +13,6 @@
 
 #include <switch.h>
 
-#define OWNER_TID 0x0100000000000816ULL
 #define ENTRY_PATH "/entry"
 #define BUF_SIZE 0x40
 
@@ -30,54 +34,83 @@ static void fmtTime(char *out, size_t out_size, u64 secs) {
   strftime(out, out_size, "%Y-%m-%d %H:%M:%S UTC", &tmv);
 }
 
-// Open the ssversion SystemSaveData. The save may be registered under the
-// plain id (System/SafeMode spaces) or with bit63 set (ProperSystem), and
-// hori matches on the owner tid in the attribute too, so sweep the small
-// matrix: space x id x application_id, printing every miss.
-static Result openSsVersion(FsFileSystem *fs) {
-  Result last = MAKERESULT(Module_Libnx, LibnxError_NotFound);
-  static const FsSaveDataSpaceId spaces[] = {
-      FsSaveDataSpaceId_ProperSystem,
-      FsSaveDataSpaceId_System,
-      FsSaveDataSpaceId_SafeMode,
-  };
-  static const u64 ids[] = { 0x49ULL, 0x8000000000000049ULL };
-  static const u64 apps[] = { FS_SAVEDATA_CURRENT_APPLICATIONID, OWNER_TID };
+static bool isSsVersionId(u64 id) {
+  return id == 0x49ULL || id == 0x8000000000000049ULL;
+}
 
-  for (size_t si = 0; si < sizeof(spaces) / sizeof(spaces[0]); si++) {
-    for (size_t ii = 0; ii < sizeof(ids) / sizeof(ids[0]); ii++) {
-      for (size_t ai = 0; ai < sizeof(apps) / sizeof(apps[0]); ai++) {
-        FsSaveDataAttribute attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.application_id = apps[ai];
-        attr.system_save_data_id = ids[ii];
-        attr.save_data_type = FsSaveDataType_System;
-        attr.save_data_rank = FsSaveDataRank_Primary;
+static void printInfo(const FsSaveDataInfo *info) {
+  u64 uid_hi = 0, uid_lo = 0;
+  memcpy(&uid_hi, info->uid.uid, 8);
+  memcpy(&uid_lo, info->uid.uid + 8, 8);
+  printf("rec: space=%d type=%d rank=%d idx=%u ssid=%016llx app=%016llx"
+         " uid=%016llx%016llx size=%lld\n",
+         (int)info->save_data_space_id, (int)info->save_data_type,
+         (int)info->save_data_rank, info->save_data_index,
+         (unsigned long long)info->system_save_data_id,
+         (unsigned long long)info->application_id,
+         (unsigned long long)uid_hi, (unsigned long long)uid_lo,
+         (long long)info->size);
+}
 
-        Result rc = fsOpenSaveDataFileSystemBySystemSaveDataId(
-            fs, spaces[si], &attr);
-        if (R_SUCCEEDED(rc)) {
-          printf("opened: space=%d id=%016llx app=%016llx\n", (int)spaces[si],
-                 (unsigned long long)ids[ii],
-                 (unsigned long long)apps[ai]);
-          return rc;
-        }
-        last = rc;
-        printf("miss: space=%d id=%016llx app=%016llx rc=0x%x\n",
-               (int)spaces[si], (unsigned long long)ids[ii],
-               (unsigned long long)apps[ai], rc);
-      }
-    }
+// Enumerate all save spaces, print the records, fill 'picked' with the
+// ssversion entry (or the first System-type entry as a fallback).
+static bool findSsVersion(FsSaveDataInfo *picked) {
+  FsSaveDataInfoReader reader;
+  bool found = false;
+  bool fallback_done = false;
+
+  Result rc = fsOpenSaveDataInfoReader(&reader, FsSaveDataSpaceId_All);
+  if (R_FAILED(rc)) {
+    printf("fsOpenSaveDataInfoReader: 0x%x\n", rc);
+    return false;
   }
-  return last;
+
+  FsSaveDataInfo info;
+  s64 total = 0;
+  do {
+    total = 0;
+    rc = fsSaveDataInfoReaderRead(&reader, &info, 1, &total);
+    if (R_FAILED(rc) || total == 0) break;
+    printInfo(&info);
+    if (!found && isSsVersionId(info.system_save_data_id)) {
+      *picked = info;
+      found = true;
+    } else if (!fallback_done && info.save_data_type == FsSaveDataType_System &&
+               info.system_save_data_id != 0) {
+      *picked = info; // keep a candidate in case the exact id is absent
+      fallback_done = true;
+    }
+  } while (true);
+
+  fsSaveDataInfoReaderClose(&reader);
+  return found || fallback_done;
+}
+
+static Result openFromInfo(FsFileSystem *fs, const FsSaveDataInfo *info) {
+  FsSaveDataAttribute attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.application_id = info->application_id;
+  attr.uid = info->uid;
+  attr.system_save_data_id = info->system_save_data_id;
+  attr.save_data_type = info->save_data_type;
+  attr.save_data_rank = info->save_data_rank;
+  attr.save_data_index = info->save_data_index;
+
+  printf("opening: space=%d ssid=%016llx app=%016llx type=%d rank=%d\n",
+         (int)info->save_data_space_id,
+         (unsigned long long)info->system_save_data_id,
+         (unsigned long long)info->application_id,
+         (int)info->save_data_type, (int)info->save_data_rank);
+  return fsOpenSaveDataFileSystemBySystemSaveDataId(
+      fs, (FsSaveDataSpaceId)info->save_data_space_id, &attr);
 }
 
 static void dumpEntry(FsFileSystem *fs) {
   u8 buf[BUF_SIZE];
   u64 read = 0;
   FsFile file;
-  // OpenMode_Read == 1; works on libnx and libounce alike.
-  Result rc = fsFsOpenFile(fs, ENTRY_PATH, 1, &file);
+  // FsOpenMode_Read == BIT(0); named identically on libnx and libounce.
+  Result rc = fsFsOpenFile(fs, ENTRY_PATH, FsOpenMode_Read, &file);
   if (R_SUCCEEDED(rc)) {
     rc = fsFileRead(&file, 0, buf, BUF_SIZE, FsReadOption_None, &read);
     fsFileClose(&file);
@@ -115,19 +148,28 @@ static void dumpEntry(FsFileSystem *fs) {
   printf("last check   : %llu (%s)\n", (unsigned long long)last_check, t1);
   printf("fw version   : %u.%u.%u\n", major, minor, micro);
   printf("time valid   : %u\n", time_set);
-  printf("last 'no upd': %llu (%s)\n", (unsigned long long)last_no_update, t2);
+  printf("last 'no upd': %llu (%s)\n", (unsigned long long)last_no_update,
+         t2);
 }
 
 int main(int argc, char *argv[]) {
   consoleInit(NULL);
 
+  FsSaveDataInfo info;
+  memset(&info, 0, sizeof(info));
   FsFileSystem fs;
-  Result rc = openSsVersion(&fs);
-  if (R_SUCCEEDED(rc)) {
-    dumpEntry(&fs);
-    fsFsClose(&fs);
+  Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+
+  if (findSsVersion(&info)) {
+    rc = openFromInfo(&fs, &info);
+    if (R_SUCCEEDED(rc)) {
+      dumpEntry(&fs);
+      fsFsClose(&fs);
+    } else {
+      printf("open failed: 0x%x\n", rc);
+    }
   } else {
-    printf("no matching SystemSaveData, last rc=0x%x\n", rc);
+    printf("no SystemSaveData matched\n");
   }
 
   PadState pad;

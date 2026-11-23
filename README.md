@@ -4,8 +4,11 @@ Tiny Switch homebrew that dumps the `ns_ssversion:/entry` SystemSaveData
 (system save id `0x49`, the record holding the SystemUpdate title id
 `0100000000000816`) as hex and as parsed fields.
 
-Opens the save through `fsOpenSaveDataFileSystemBySystemSaveDataId`, reads
-`/entry` (up to 0x40 bytes) and prints:
+Enumerates SystemSaveData records with `fsOpenSaveDataInfoReader`
+(all spaces), prints every record found, then opens the match through
+`fsOpenSaveDataFileSystemBySystemSaveDataId` using exactly the attributes
+the reader returned - fsp-srv matches the whole filter, so this is the
+reliable order on both consoles. Reads `/entry` (up to 0x40 bytes) and prints:
 
 ```
 == hex (48 bytes) ==
