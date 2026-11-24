@@ -1,14 +1,13 @@
-// ssversion: dump the SystemUpdate ssversion SystemSaveData (id 0x49 /
-// 0x8000000000000049, ns_ssversion:/entry) as hex + parsed fields.
-// Builds for Switch 1 (libnx) and Switch 2 (libounce) from this one file.
+// ssversion: dump the SystemUpdate ssversion SystemSaveData (id
+// 0x8000000000000049 per switchbrew SystemSaveData, ns_ssversion:/entry)
+// as hex + parsed fields. Builds for Switch 1 (libnx) and Switch 2
+// (libounce) from this one file.
 //
-// Strategy (v1.4, modelled on Adubbz/Gag-Order which reads the same save):
-// enumerate with the save-info reader to find the record, then mount it
-// with fsdevMountSystemSaveData() - that helper assembles the attribute
-// set the way fsp-srv expects (ssid keeps the 0x8... high bits) instead
-// of hand-building it, which is why plain fsOpen...BySystemSaveDataId
-// calls reject with Fs errors (0xe02 etc). Retry rounds of the mount like
-// Gag-Order does; fall back to direct opens if the helper is unavailable.
+// Strategy (v1.5, follows Adubbz/Gag-Order's proven sequence): terminate
+// ns via pmshell FIRST so it releases the save, then mount through the
+// fsdev helper fsdevMountSystemSaveData() which assembles the attribute
+// tuple fsp-srv wants. Direct bySsid opens stay as fallback. Console
+// output is kept short so nothing important scrolls off.
 
 #include <stdio.h>
 #include <string.h>
@@ -20,7 +19,9 @@
 #define BUF_SIZE 0x40
 #define DEV_NAME "ssv"
 
-// Owner of the ssversion SystemSaveData: SystemUpdate (ns).
+// ns (SystemUpdate) program id, per Gag-Order's terminate call.
+#define NS_TID 0x010000000000001FULL
+// Owner of the ssversion save as stored in the entry header itself.
 #define OWNER_TID 0x0100000000000816ULL
 
 static const char *stateName(u8 s) {
@@ -45,30 +46,25 @@ static bool isSsVersionId(u64 id) {
   return id == 0x49ULL || id == 0x8000000000000049ULL;
 }
 
-static void printInfo(const FsSaveDataInfo *info) {
-  u64 uid_hi = 0, uid_lo = 0;
-  memcpy(&uid_hi, info->uid.uid, 8);
-  memcpy(&uid_lo, info->uid.uid + 8, 8);
-  printf("rec: space=%d type=%d rank=%d idx=%u ssid=%016llx app=%016llx"
-         " uid=%016llx%016llx size=%lld\n",
-         (int)info->save_data_space_id, (int)info->save_data_type,
-         (int)info->save_data_rank, info->save_data_index,
+static void printRec(const char *tag, const FsSaveDataInfo *info) {
+  printf("%s space=%d ssid=%016llx app=%016llx type=%d rank=%d\n", tag,
+         (int)info->save_data_space_id,
          (unsigned long long)info->system_save_data_id,
          (unsigned long long)info->application_id,
-         (unsigned long long)uid_hi, (unsigned long long)uid_lo,
-         (long long)info->size);
+         (int)info->save_data_type, (int)info->save_data_rank);
 }
 
-// Enumerate all save spaces, print the records, fill 'picked' with the
-// ssversion entry (or the first System-type entry as a fallback).
+// Enumerate save records; print count + the matched record only, so the
+// console keeps the interesting lines on screen. Fill 'picked'.
 static bool findSsVersion(FsSaveDataInfo *picked) {
   FsSaveDataInfoReader reader;
   bool found = false;
   bool fallback_done = false;
+  int count = 0;
 
   Result rc = fsOpenSaveDataInfoReader(&reader, FsSaveDataSpaceId_All);
   if (R_FAILED(rc)) {
-    printf("fsOpenSaveDataInfoReader: 0x%x\n", rc);
+    printf("infoReader: 0x%x\n", rc);
     return false;
   }
 
@@ -78,7 +74,7 @@ static bool findSsVersion(FsSaveDataInfo *picked) {
     total = 0;
     rc = fsSaveDataInfoReaderRead(&reader, &info, 1, &total);
     if (R_FAILED(rc) || total == 0) break;
-    printInfo(&info);
+    count++;
     if (!found && isSsVersionId(info.system_save_data_id)) {
       *picked = info;
       found = true;
@@ -90,13 +86,23 @@ static bool findSsVersion(FsSaveDataInfo *picked) {
   } while (true);
 
   fsSaveDataInfoReaderClose(&reader);
+  printf("scanned %d saves\n", count);
+  if (found) printRec("match:", picked);
+  else if (fallback_done) printRec("fallback:", picked);
   return found || fallback_done;
 }
 
-static FsFileSystem s_fs; // survives for direct-open handles
+static void terminateNs(void) {
+  Result rc = pmshellInitialize();
+  if (R_FAILED(rc)) { printf("pmshell: 0x%x\n", rc); return; }
+  rc = pmshellTerminateProgram(NS_TID);
+  printf("ns terminate: 0x%x\n", rc);
+  pmshellExit();
+}
 
-// Gag-Order style: fsdevMountSystemSaveData + fsdevGetDeviceFileSystem.
-// Retry rounds in case ns is mid-write; several spaces/ssid/uid variants.
+// Gag-Order order: kill ns so it releases the save, then mount via the
+// fsdev helper. Sweep space/ssid/uid variants; loop rounds in case ns
+// respawns and grabs the save again mid-way.
 static FsFileSystem *mountViaHelper(const FsSaveDataInfo *info) {
   AccountUid zero;
   memset(&zero, 0, sizeof(zero));
@@ -107,26 +113,31 @@ static FsFileSystem *mountViaHelper(const FsSaveDataInfo *info) {
   const AccountUid *uids[2] = { &info->uid, &zero };
 
   Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
-  for (int round = 0; round < 20 && R_FAILED(rc); round++) {
+  Result last = rc;
+  terminateNs();
+  for (int round = 0; round < 10 && R_FAILED(rc); round++) {
     for (int u = 0; u < 2 && R_FAILED(rc); u++) {
       for (int s = 0; s < 2 && R_FAILED(rc); s++) {
         for (int i = 0; i < 2 && R_FAILED(rc); i++) {
           rc = fsdevMountSystemSaveData(DEV_NAME, spaces[s], ssids[i], *uids[u]);
-          if (R_FAILED(rc))
-            printf("mount sp=%d ssid=%s uid=%s -> 0x%x\n", (int)spaces[s],
-                   ssids[i] == 0x49ULL ? "49" : "raw",
-                   u == 0 ? "rec" : "zero", rc);
+          last = rc;
         }
       }
     }
+    if (R_FAILED(rc)) terminateNs(); // ns may have re-locked it
   }
 
-  if (R_FAILED(rc)) return NULL;
-  printf("mounted via fsdevMountSystemSaveData\n");
+  if (R_FAILED(rc)) {
+    printf("helper mount failed: 0x%x\n", last);
+    return NULL;
+  }
+  printf("mounted via helper\n");
   return fsdevGetDeviceFileSystem(DEV_NAME);
 }
 
-// Direct-open fallback chain: exact enumerated attrs, then + owner tid.
+// Direct-open fallback: exact enumerated attrs, then + owner tid.
+static FsFileSystem s_fs;
+
 static FsFileSystem *openDirect(const FsSaveDataInfo *info) {
   FsSaveDataAttribute attr;
   memset(&attr, 0, sizeof(attr));
@@ -164,7 +175,7 @@ static void dumpEntry(FsFileSystem *fs) {
   }
 
   if (R_FAILED(rc) || read == 0) {
-    printf("open/read " ENTRY_PATH " failed: 0x%x (read %llu)\n", rc,
+    printf("read " ENTRY_PATH " failed: 0x%x (read %llu)\n", rc,
            (unsigned long long)read);
     return;
   }
@@ -205,16 +216,11 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v1.4\n\n");
+  printf("ssversion dumper v1.5\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
   if (findSsVersion(&info)) {
-    printf("\npicked: space=%d ssid=%016llx app=%016llx type=%d rank=%d\n",
-           (int)info.save_data_space_id,
-           (unsigned long long)info.system_save_data_id,
-           (unsigned long long)info.application_id,
-           (int)info.save_data_type, (int)info.save_data_rank);
     fs = mountViaHelper(&info);
     if (fs) {
       via_fsdev = true;
