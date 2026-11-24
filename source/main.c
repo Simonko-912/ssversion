@@ -1,11 +1,14 @@
-// ssversion: dump the SystemUpdate ssversion SystemSaveData (id ...49,
-// ns_ssversion:/entry) as hex + parsed fields.
+// ssversion: dump the SystemUpdate ssversion SystemSaveData (id 0x49 /
+// 0x8000000000000049, ns_ssversion:/entry) as hex + parsed fields.
 // Builds for Switch 1 (libnx) and Switch 2 (libounce) from this one file.
 //
-// Strategy: enumerate SystemSaveData records with the save-info reader,
-// print every record, then open the matching one with EXACTLY the
-// attributes the reader returned (fsp-srv on Switch 1 matches every
-// nonzero filter field, so hand-built attributes are unreliable).
+// Strategy (v1.4, modelled on Adubbz/Gag-Order which reads the same save):
+// enumerate with the save-info reader to find the record, then mount it
+// with fsdevMountSystemSaveData() - that helper assembles the attribute
+// set the way fsp-srv expects (ssid keeps the 0x8... high bits) instead
+// of hand-building it, which is why plain fsOpen...BySystemSaveDataId
+// calls reject with Fs errors (0xe02 etc). Retry rounds of the mount like
+// Gag-Order does; fall back to direct opens if the helper is unavailable.
 
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +18,10 @@
 
 #define ENTRY_PATH "/entry"
 #define BUF_SIZE 0x40
+#define DEV_NAME "ssv"
+
+// Owner of the ssversion SystemSaveData: SystemUpdate (ns).
+#define OWNER_TID 0x0100000000000816ULL
 
 static const char *stateName(u8 s) {
   switch (s) {
@@ -86,12 +93,41 @@ static bool findSsVersion(FsSaveDataInfo *picked) {
   return found || fallback_done;
 }
 
-// Owner of the ssversion SystemSaveData: SystemUpdate (ns). The info
-// reader reports app=0 for System-type saves, but fsp-srv still matches
-// the owner internally, so retry with the real owner id if needed.
-#define OWNER_TID 0x0100000000000816ULL
+static FsFileSystem s_fs; // survives for direct-open handles
 
-static Result openFromInfo(FsFileSystem *fs, const FsSaveDataInfo *info) {
+// Gag-Order style: fsdevMountSystemSaveData + fsdevGetDeviceFileSystem.
+// Retry rounds in case ns is mid-write; several spaces/ssid/uid variants.
+static FsFileSystem *mountViaHelper(const FsSaveDataInfo *info) {
+  AccountUid zero;
+  memset(&zero, 0, sizeof(zero));
+
+  FsSaveDataSpaceId spaces[2] = { (FsSaveDataSpaceId)info->save_data_space_id,
+                                  FsSaveDataSpaceId_ProperSystem };
+  u64 ssids[2] = { info->system_save_data_id, 0x49ULL };
+  const AccountUid *uids[2] = { &info->uid, &zero };
+
+  Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+  for (int round = 0; round < 20 && R_FAILED(rc); round++) {
+    for (int u = 0; u < 2 && R_FAILED(rc); u++) {
+      for (int s = 0; s < 2 && R_FAILED(rc); s++) {
+        for (int i = 0; i < 2 && R_FAILED(rc); i++) {
+          rc = fsdevMountSystemSaveData(DEV_NAME, spaces[s], ssids[i], *uids[u]);
+          if (R_FAILED(rc))
+            printf("mount sp=%d ssid=%s uid=%s -> 0x%x\n", (int)spaces[s],
+                   ssids[i] == 0x49ULL ? "49" : "raw",
+                   u == 0 ? "rec" : "zero", rc);
+        }
+      }
+    }
+  }
+
+  if (R_FAILED(rc)) return NULL;
+  printf("mounted via fsdevMountSystemSaveData\n");
+  return fsdevGetDeviceFileSystem(DEV_NAME);
+}
+
+// Direct-open fallback chain: exact enumerated attrs, then + owner tid.
+static FsFileSystem *openDirect(const FsSaveDataInfo *info) {
   FsSaveDataAttribute attr;
   memset(&attr, 0, sizeof(attr));
   attr.application_id = info->application_id;
@@ -101,43 +137,19 @@ static Result openFromInfo(FsFileSystem *fs, const FsSaveDataInfo *info) {
   attr.save_data_rank = info->save_data_rank;
   attr.save_data_index = info->save_data_index;
 
-  printf("opening: space=%d ssid=%016llx app=%016llx type=%d rank=%d\n",
-         (int)info->save_data_space_id,
-         (unsigned long long)info->system_save_data_id,
-         (unsigned long long)info->application_id,
-         (int)info->save_data_type, (int)info->save_data_rank);
-
   FsSaveDataSpaceId space = (FsSaveDataSpaceId)info->save_data_space_id;
-  Result rc = fsOpenSaveDataFileSystemBySystemSaveDataId(fs, space, &attr);
+  Result rc = fsOpenSaveDataFileSystemBySystemSaveDataId(&s_fs, space, &attr);
   if (R_SUCCEEDED(rc)) {
     printf("opened: bySsid exact\n");
-    return rc;
+    return &s_fs;
   }
-  printf("attempt1 rc=0x%x\n", rc);
+  printf("bySsid exact rc=0x%x\n", rc);
 
-  // Retry with the real owner tid (SystemUpdate) + enumerated attrs.
   attr.application_id = OWNER_TID;
-  rc = fsOpenSaveDataFileSystemBySystemSaveDataId(fs, space, &attr);
-  if (R_SUCCEEDED(rc)) {
-    printf("opened: bySsid owner+0100000000000816\n");
-    return rc;
-  }
-  printf("attempt2 rc=0x%x\n", rc);
-
-  // Last resort: generic open with the same attribute.
-  rc = fsOpenSaveDataFileSystem(fs, space, &attr);
-  if (R_SUCCEEDED(rc)) {
-    printf("opened: generic\n");
-    return rc;
-  }
-  printf("attempt3 rc=0x%x\n", rc);
-
-  // Also try generic open with the reader's original (app=0) attrs.
-  attr.application_id = info->application_id;
-  rc = fsOpenSaveDataFileSystem(fs, space, &attr);
-  if (R_SUCCEEDED(rc)) printf("opened: generic exact\n");
-  else printf("attempt4 rc=0x%x\n", rc);
-  return rc;
+  rc = fsOpenSaveDataFileSystemBySystemSaveDataId(&s_fs, space, &attr);
+  if (R_SUCCEEDED(rc)) printf("opened: bySsid owner-tid\n");
+  else printf("bySsid owner rc=0x%x\n", rc);
+  return R_SUCCEEDED(rc) ? &s_fs : NULL;
 }
 
 static void dumpEntry(FsFileSystem *fs) {
@@ -192,20 +204,29 @@ int main(int argc, char *argv[]) {
 
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
-  FsFileSystem fs;
-  Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
 
+  printf("ssversion dumper v1.4\n\n");
+
+  FsFileSystem *fs = NULL;
+  bool via_fsdev = false;
   if (findSsVersion(&info)) {
-    rc = openFromInfo(&fs, &info);
-    if (R_SUCCEEDED(rc)) {
-      dumpEntry(&fs);
-      fsFsClose(&fs);
+    printf("\npicked: space=%d ssid=%016llx app=%016llx type=%d rank=%d\n",
+           (int)info.save_data_space_id,
+           (unsigned long long)info.system_save_data_id,
+           (unsigned long long)info.application_id,
+           (int)info.save_data_type, (int)info.save_data_rank);
+    fs = mountViaHelper(&info);
+    if (fs) {
+      via_fsdev = true;
     } else {
-      printf("open failed: 0x%x\n", rc);
+      fs = openDirect(&info);
     }
   } else {
     printf("no SystemSaveData matched\n");
   }
+
+  if (fs) dumpEntry(fs);
+  else printf("open failed\n");
 
   PadState pad;
   padInitializeDefault(&pad);
@@ -214,6 +235,7 @@ int main(int argc, char *argv[]) {
     if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
     consoleUpdate(NULL);
   }
+  if (via_fsdev) fsdevUnmountDevice(DEV_NAME);
   consoleExit(NULL);
   return 0;
 }
