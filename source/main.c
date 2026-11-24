@@ -103,14 +103,9 @@ static void terminateNs(void) {
   rc = pmshellTerminateProgram(NS_TID);
   printf("ns terminate: 0x%x\n", rc);
 
-  // Hardware showed pm does NOT reliably relaunch ns on its own after
-  // terminate (black screen until reboot). So don't depend on pm:
-  // check briefly whether ns returned by itself, then explicitly
-  // relaunch it ourselves via pmshellLaunchProgram, then verify.
+  // Brief grace in case pm does bring ns back by itself.
   bool ready = false;
   u64 pid = 0;
-
-  // Short grace so a still-registered ns isn't double-launched.
   for (int i = 0; i < 10 && !ready; i++) {
     svcSleepThread(100e6);
     pid = 0;
@@ -118,13 +113,12 @@ static void terminateNs(void) {
         pid != oldPid) ready = true;
   }
 
+  // Explicit relaunch, two storage ids max. Each step prints its rc so
+  // a start-time crash leaves the last good marker on screen.
   if (!ready) {
-    // ns lives in BuiltInSystem; storage 'Any' may not resolve for a
-    // sysmodule, so try BuiltInSystem first, then Any, then 0.
-    static const u8 storages[3] = { NcmStorageId_BuiltInSystem,
-                                    NcmStorageId_Any,
-                                    NcmStorageId_None };
-    for (int a = 0; a < 3 && !ready; a++) {
+    static const u8 storages[2] = { NcmStorageId_BuiltInSystem,
+                                    NcmStorageId_Any };
+    for (int a = 0; a < 2 && !ready; a++) {
       NcmProgramLocation loc;
       memset(&loc, 0, sizeof(loc));
       loc.program_id = NS_TID;
@@ -133,10 +127,8 @@ static void terminateNs(void) {
       Result lrc = pmshellLaunchProgram(PmLaunchFlag_None, &loc, &newPid);
       printf("ns launch st=%d: 0x%x\n", (int)storages[a], lrc);
       if (R_FAILED(lrc)) continue;
-      // Verify with pmshellGetProcessId only: it is the query proven
-      // to work from these builds (pmdmnt variant coincided with the
-      // 2145-0024 start crash).
-      for (int i = 0; i < 30 && !ready; i++) {
+      pid = 0;
+      for (int i = 0; i < 20 && !ready; i++) {
         svcSleepThread(100e6);
         pid = 0;
         if (R_SUCCEEDED(pmshellGetProcessId(&pid, NS_TID)) && pid != 0 &&
@@ -316,7 +308,7 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v2.3\n\n");
+  printf("ssversion dumper v2.4\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
