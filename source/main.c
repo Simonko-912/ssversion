@@ -103,19 +103,27 @@ static void terminateNs(void) {
   rc = pmshellTerminateProgram(NS_TID);
   printf("ns terminate: 0x%x\n", rc);
 
-  // Wait for ns to come back with a REAL pause between polls: the
-  // old tight spin loop drained in milliseconds, long before pm
-  // re-launches ns, so it bailed with pid=0 and HOME-exit still hit
-  // a dead ns. Poll every 50ms up to ~4s; any non-zero pid different
-  // from the old one counts as respawned.
+  // Wait for ns to actually come back. Two readiness signals, either
+  // counts: pm hands back a fresh non-zero pid, OR the ns:cm service
+  // is connectable again (nsInitialize succeeds). The pid-only check
+  // kept reporting 0 on hardware even seconds after the terminate,
+  // so the service-connect probe is the reliable one. Poll every
+  // 100ms up to ~15s.
+  bool ready = false;
   u64 pid = 0;
-  for (int i = 0; i < 80; i++) {
-    svcSleepThread(50e6);
+  for (int i = 0; i < 150 && !ready; i++) {
+    svcSleepThread(100e6);
     pid = 0;
-    if (R_FAILED(pmshellGetProcessId(&pid, NS_TID))) pid = 0;
-    if (pid != 0 && pid != oldPid) break;
+    if (R_SUCCEEDED(pmshellGetProcessId(&pid, NS_TID)) && pid != 0 &&
+        pid != oldPid) {
+      ready = true;
+    } else {
+      Result nrc = nsInitialize();
+      if (R_SUCCEEDED(nrc)) { nsExit(); ready = true; }
+    }
   }
-  printf("ns respawned: %llu\n", (unsigned long long)pid);
+  printf("ns back: %s pid=%llu\n", ready ? "yes" : "no",
+         (unsigned long long)pid);
   pmshellExit();
 }
 
@@ -282,7 +290,7 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v1.9\n\n");
+  printf("ssversion dumper v2.0\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
