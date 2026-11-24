@@ -103,24 +103,41 @@ static void terminateNs(void) {
   rc = pmshellTerminateProgram(NS_TID);
   printf("ns terminate: 0x%x\n", rc);
 
-  // Wait for ns to actually come back. Two readiness signals, either
-  // counts: pm hands back a fresh non-zero pid, OR the ns:cm service
-  // is connectable again (nsInitialize succeeds). The pid-only check
-  // kept reporting 0 on hardware even seconds after the terminate,
-  // so the service-connect probe is the reliable one. Poll every
-  // 100ms up to ~15s.
+  // Hardware showed pm does NOT reliably relaunch ns on its own after
+  // terminate (black screen until reboot). So don't depend on pm:
+  // check briefly whether ns returned by itself, then explicitly
+  // relaunch it ourselves via pmshellLaunchProgram, then verify.
   bool ready = false;
   u64 pid = 0;
-  for (int i = 0; i < 150 && !ready; i++) {
+
+  // Short grace so a still-registered ns isn't double-launched.
+  for (int i = 0; i < 10 && !ready; i++) {
     svcSleepThread(100e6);
     pid = 0;
     if (R_SUCCEEDED(pmshellGetProcessId(&pid, NS_TID)) && pid != 0 &&
-        pid != oldPid) {
-      ready = true;
-    } else {
-      Result nrc = nsInitialize();
-      if (R_SUCCEEDED(nrc)) { nsExit(); ready = true; }
+        pid != oldPid) ready = true;
+  }
+
+  Result lrc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
+  if (!ready) {
+    NcmProgramLocation loc;
+    memset(&loc, 0, sizeof(loc));
+    loc.program_id = NS_TID;
+    loc.storageID = NcmStorageId_Any;
+    u64 newPid = 0;
+    lrc = pmshellLaunchProgram(PmLaunchFlag_None, &loc, &newPid);
+    printf("ns launch: 0x%x\n", lrc);
+    for (int i = 0; i < 40 && !ready; i++) {
+      svcSleepThread(100e6);
+      pid = 0;
+      if (R_SUCCEEDED(pmshellGetProcessId(&pid, NS_TID)) && pid != 0 &&
+          pid != oldPid) ready = true;
+      else {
+        Result nrc = nsInitialize();
+        if (R_SUCCEEDED(nrc)) { nsExit(); ready = true; }
+      }
     }
+    if (pid == 0 && newPid != 0) pid = newPid;
   }
   printf("ns back: %s pid=%llu\n", ready ? "yes" : "no",
          (unsigned long long)pid);
@@ -290,7 +307,7 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v2.0\n\n");
+  printf("ssversion dumper v2.1\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
