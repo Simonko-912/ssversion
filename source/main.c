@@ -96,52 +96,8 @@ static bool findSsVersion(FsSaveDataInfo *picked) {
 static void terminateNs(void) {
   Result rc = pmshellInitialize();
   if (R_FAILED(rc)) { printf("pmshell: 0x%x\n", rc); return; }
-
-  u64 oldPid = 0;
-  pmshellGetProcessId(&oldPid, NS_TID);
-
   rc = pmshellTerminateProgram(NS_TID);
   printf("ns terminate: 0x%x\n", rc);
-
-  // Brief grace in case pm does bring ns back by itself.
-  bool ready = false;
-  u64 pid = 0;
-  for (int i = 0; i < 10 && !ready; i++) {
-    svcSleepThread(100e6);
-    pid = 0;
-    if (R_SUCCEEDED(pmshellGetProcessId(&pid, NS_TID)) && pid != 0 &&
-        pid != oldPid) ready = true;
-  }
-
-  // Explicit relaunch, two storage ids max. Each step prints its rc so
-  // a start-time crash leaves the last good marker on screen.
-  if (!ready) {
-    static const u8 storages[2] = { NcmStorageId_BuiltInSystem,
-                                    NcmStorageId_Any };
-    for (int a = 0; a < 2 && !ready; a++) {
-      NcmProgramLocation loc;
-      memset(&loc, 0, sizeof(loc));
-      loc.program_id = NS_TID;
-      loc.storageID = storages[a];
-      u64 newPid = 0;
-      Result lrc = pmshellLaunchProgram(PmLaunchFlag_None, &loc, &newPid);
-      printf("ns launch st=%d: 0x%x\n", (int)storages[a], lrc);
-      if (R_FAILED(lrc)) continue;
-      pid = 0;
-      for (int i = 0; i < 20 && !ready; i++) {
-        svcSleepThread(100e6);
-        pid = 0;
-        if (R_SUCCEEDED(pmshellGetProcessId(&pid, NS_TID)) && pid != 0 &&
-            pid != oldPid) {
-          ready = true;
-          break;
-        }
-      }
-      if (pid == 0 && newPid != 0) pid = newPid;
-    }
-  }
-  printf("ns back: %s pid=%llu\n", ready ? "yes" : "no",
-         (unsigned long long)pid);
   pmshellExit();
 }
 
@@ -161,8 +117,13 @@ static FsFileSystem *mountViaHelper(FsSaveDataInfo *info) {
   Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
   Result last = rc;
 
-  // Round 1: mount with ns left running - reading the save usually
-  // works and avoids the HOME-button crash seen after terminating ns.
+  // v1.5/v1.6 order, per hardware feedback: terminate ns FIRST so it
+  // releases the save, then mount. Relaunching ns afterward is
+  // pointless - dependent services don't reconnect to a re-launched
+  // ns - so the app just does its read and exits.
+  terminateNs();
+
+  // Fixed documented id, both spaces, both ssid spellings.
   for (int s = 0; s < 2 && R_FAILED(rc); s++) {
     for (int i = 0; i < 2 && R_FAILED(rc); i++) {
       rc = fsdevMountSystemSaveData(DEV_NAME, spaces[s], ssids[i], zero);
@@ -170,44 +131,22 @@ static FsFileSystem *mountViaHelper(FsSaveDataInfo *info) {
     }
   }
 
-  // Round 2: enumerate to recover the exact stored attrs (esp. the
-  // real uid instead of zero) and retry the helper mount before
-  // touching ns at all - most HOME-crash reports came from the
-  // terminate, so exhaust the gentle paths first.
-  if (R_FAILED(rc) && findSsVersion(info)) {
-    rc = fsdevMountSystemSaveData(DEV_NAME,
-                                  (FsSaveDataSpaceId)info->save_data_space_id,
-                                  info->system_save_data_id, info->uid);
-    last = rc;
-    if (R_FAILED(rc)) {
-      rc = fsdevMountSystemSaveData(DEV_NAME,
-                                    (FsSaveDataSpaceId)info->save_data_space_id,
-                                    info->system_save_data_id, zero);
-      last = rc;
-    }
-  }
-
-  // Still locked? fall back to gag-order's order: kill ns, retry.
-  for (int round = 0; round < 10 && R_FAILED(rc); round++) {
+  // Locked again mid-way? re-terminate and retry, gag-order style;
+  // last resort is the enumerated attrs (exact stored uid).
+  int guard = 0;
+  while (R_FAILED(rc) && guard++ < 5) {
     terminateNs();
+    svcSleepThread(200e6);
     for (int s = 0; s < 2 && R_FAILED(rc); s++) {
       for (int i = 0; i < 2 && R_FAILED(rc); i++) {
         rc = fsdevMountSystemSaveData(DEV_NAME, spaces[s], ssids[i], zero);
         last = rc;
       }
     }
-    if (R_FAILED(rc)) {
-      // Once more with the stored attrs from the reader (exact uid).
-    if (info->system_save_data_id == 0) findSsVersion(info);
-      if (!findSsVersion(info)) continue;
+    if (R_FAILED(rc) && findSsVersion(info)) {
       rc = fsdevMountSystemSaveData(DEV_NAME,
                                     (FsSaveDataSpaceId)info->save_data_space_id,
                                     info->system_save_data_id, info->uid);
-      last = rc;
-      if (R_SUCCEEDED(rc)) break;
-      rc = fsdevMountSystemSaveData(DEV_NAME,
-                                    (FsSaveDataSpaceId)info->save_data_space_id,
-                                    info->system_save_data_id, zero);
       last = rc;
     }
   }
@@ -308,7 +247,7 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v2.4\n\n");
+  printf("ssversion dumper v2.5\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
