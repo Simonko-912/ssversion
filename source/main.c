@@ -54,8 +54,9 @@ static void printRec(const char *tag, const FsSaveDataInfo *info) {
          (int)info->save_data_type, (int)info->save_data_rank);
 }
 
-// Enumerate save records; print count + the matched record only, so the
-// console keeps the interesting lines on screen. Fill 'picked'.
+// Enumerate save records only as a fallback when the direct mount with
+// the documented fixed id fails: find the exact stored attrs. Fill
+// 'picked'. Returns false if no SystemSaveData matched.
 static bool findSsVersion(FsSaveDataInfo *picked) {
   FsSaveDataInfoReader reader;
   bool found = false;
@@ -101,30 +102,42 @@ static void terminateNs(void) {
 }
 
 // Gag-Order order: kill ns so it releases the save, then mount via the
-// fsdev helper. Sweep space/ssid/uid variants; loop rounds in case ns
-// respawns and grabs the save again mid-way.
-static FsFileSystem *mountViaHelper(const FsSaveDataInfo *info) {
+// fsdev helper with the documented fixed id (switchbrew SystemSaveData:
+// 0x8000000000000049 on both console generations). Zero uid, sweep
+// sys/proper space + raw/trimmed id. Enumeration only runs if this all
+// fails; loop rounds in case ns respawns and relocks mid-way.
+static FsFileSystem *mountViaHelper(FsSaveDataInfo *info) {
   AccountUid zero;
   memset(&zero, 0, sizeof(zero));
 
-  FsSaveDataSpaceId spaces[2] = { (FsSaveDataSpaceId)info->save_data_space_id,
+  FsSaveDataSpaceId spaces[2] = { FsSaveDataSpaceId_System,
                                   FsSaveDataSpaceId_ProperSystem };
-  u64 ssids[2] = { info->system_save_data_id, 0x49ULL };
-  const AccountUid *uids[2] = { &info->uid, &zero };
+  u64 ssids[2] = { 0x8000000000000049ULL, 0x49ULL };
 
   Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
   Result last = rc;
   terminateNs();
   for (int round = 0; round < 10 && R_FAILED(rc); round++) {
-    for (int u = 0; u < 2 && R_FAILED(rc); u++) {
-      for (int s = 0; s < 2 && R_FAILED(rc); s++) {
-        for (int i = 0; i < 2 && R_FAILED(rc); i++) {
-          rc = fsdevMountSystemSaveData(DEV_NAME, spaces[s], ssids[i], *uids[u]);
-          last = rc;
-        }
+    for (int s = 0; s < 2 && R_FAILED(rc); s++) {
+      for (int i = 0; i < 2 && R_FAILED(rc); i++) {
+        rc = fsdevMountSystemSaveData(DEV_NAME, spaces[s], ssids[i], zero);
+        last = rc;
       }
     }
-    if (R_FAILED(rc)) terminateNs(); // ns may have re-locked it
+    if (R_FAILED(rc)) {
+      terminateNs(); // ns may have re-locked it
+      // Once more with the stored attrs from the reader (exact uid).
+      if (!findSsVersion(info)) continue;
+      rc = fsdevMountSystemSaveData(DEV_NAME,
+                                    (FsSaveDataSpaceId)info->save_data_space_id,
+                                    info->system_save_data_id, info->uid);
+      last = rc;
+      if (R_SUCCEEDED(rc)) break;
+      rc = fsdevMountSystemSaveData(DEV_NAME,
+                                    (FsSaveDataSpaceId)info->save_data_space_id,
+                                    info->system_save_data_id, zero);
+      last = rc;
+    }
   }
 
   if (R_FAILED(rc)) {
@@ -180,9 +193,12 @@ static void dumpEntry(FsFileSystem *fs) {
     return;
   }
 
+  // Grouped hex: two-byte groups, 8 groups (16 bytes) per line:
+  //   1608 0000 0000 0001 e001 5058 0300 0000
   printf("\n== hex (%llu bytes) ==\n", (unsigned long long)read);
-  for (u64 i = 0; i < read; i++) {
-    printf("%02x%s", buf[i], ((i & 3) == 3 || i == read - 1) ? "\n" : " ");
+  for (u64 i = 0; i < read; i += 2) {
+    printf("%02x%02x%s", buf[i], buf[i + 1 < read ? i + 1 : i],
+           (((i / 2) % 8) == 7 || i + 2 >= read) ? "\n" : " ");
   }
 
   u64 tid = *(u64 *)(buf + 0x00);
@@ -200,7 +216,11 @@ static void dumpEntry(FsFileSystem *fs) {
 
   printf("\n== parsed ==\n");
   printf("title id     : %016llx\n", (unsigned long long)tid);
-  printf("supernag     : 0x%08x\n", supernag);
+  // supernag = two u16 tunables ns checks together: cycle minutes +
+  // grace minutes. Reference pairs: nagged 0x14020028 = 40 / 5122,
+  // gag-order's unnagged 0x100000C8 = 200 / 4096.
+  printf("supernag     : 0x%08x -> %u / %u (two 16-bit halves)\n", supernag,
+         (unsigned)(supernag & 0xFFFF), (unsigned)(supernag >> 16));
   printf("0x0C         : %u\n", field0c);
   printf("state        : %u (%s)\n", state, stateName(state));
   printf("last check   : %llu (%s)\n", (unsigned long long)last_check, t1);
@@ -216,19 +236,17 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v1.5\n\n");
+  printf("ssversion dumper v1.6\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
-  if (findSsVersion(&info)) {
-    fs = mountViaHelper(&info);
-    if (fs) {
-      via_fsdev = true;
-    } else {
-      fs = openDirect(&info);
-    }
+  fs = mountViaHelper(&info);
+  if (fs) {
+    via_fsdev = true;
   } else {
-    printf("no SystemSaveData matched\n");
+    if (info.system_save_data_id == 0) findSsVersion(&info);
+    if (info.system_save_data_id != 0) fs = openDirect(&info);
+    else printf("no SystemSaveData matched\n");
   }
 
   if (fs) dumpEntry(fs);
