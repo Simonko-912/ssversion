@@ -97,22 +97,23 @@ static void terminateNs(void) {
   Result rc = pmshellInitialize();
   if (R_FAILED(rc)) { printf("pmshell: 0x%x\n", rc); return; }
 
-  // Remember the current pid so we can detect the respawn.
   u64 oldPid = 0;
   pmshellGetProcessId(&oldPid, NS_TID);
 
   rc = pmshellTerminateProgram(NS_TID);
   printf("ns terminate: 0x%x\n", rc);
 
-  // Wait until pm hands back a fresh ns pid before we continue. The
-  // HOME-exit handoff talks to ns; if ns is still down/dead when the
-  // handoff runs we get 2011-0301. Gag-Order avoids this by staying
-  // resident as an overlay (no exit handoff at all); we exit, so we
-  // make sure ns is back first.
-  u64 pid = oldPid;
-  for (int i = 0; i < 2000 && pid == oldPid; i++) {
+  // Wait for ns to come back with a REAL pause between polls: the
+  // old tight spin loop drained in milliseconds, long before pm
+  // re-launches ns, so it bailed with pid=0 and HOME-exit still hit
+  // a dead ns. Poll every 50ms up to ~4s; any non-zero pid different
+  // from the old one counts as respawned.
+  u64 pid = 0;
+  for (int i = 0; i < 80; i++) {
+    svcSleepThread(50e6);
     pid = 0;
     if (R_FAILED(pmshellGetProcessId(&pid, NS_TID))) pid = 0;
+    if (pid != 0 && pid != oldPid) break;
   }
   printf("ns respawned: %llu\n", (unsigned long long)pid);
   pmshellExit();
@@ -143,6 +144,23 @@ static FsFileSystem *mountViaHelper(FsSaveDataInfo *info) {
     }
   }
 
+  // Round 2: enumerate to recover the exact stored attrs (esp. the
+  // real uid instead of zero) and retry the helper mount before
+  // touching ns at all - most HOME-crash reports came from the
+  // terminate, so exhaust the gentle paths first.
+  if (R_FAILED(rc) && findSsVersion(info)) {
+    rc = fsdevMountSystemSaveData(DEV_NAME,
+                                  (FsSaveDataSpaceId)info->save_data_space_id,
+                                  info->system_save_data_id, info->uid);
+    last = rc;
+    if (R_FAILED(rc)) {
+      rc = fsdevMountSystemSaveData(DEV_NAME,
+                                    (FsSaveDataSpaceId)info->save_data_space_id,
+                                    info->system_save_data_id, zero);
+      last = rc;
+    }
+  }
+
   // Still locked? fall back to gag-order's order: kill ns, retry.
   for (int round = 0; round < 10 && R_FAILED(rc); round++) {
     terminateNs();
@@ -154,6 +172,7 @@ static FsFileSystem *mountViaHelper(FsSaveDataInfo *info) {
     }
     if (R_FAILED(rc)) {
       // Once more with the stored attrs from the reader (exact uid).
+    if (info->system_save_data_id == 0) findSsVersion(info);
       if (!findSsVersion(info)) continue;
       rc = fsdevMountSystemSaveData(DEV_NAME,
                                     (FsSaveDataSpaceId)info->save_data_space_id,
@@ -263,7 +282,7 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v1.8\n\n");
+  printf("ssversion dumper v1.9\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;

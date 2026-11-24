@@ -21,7 +21,7 @@ $(OUT)/ssversion.elf: source/main.c
 
 $(OUT)/ssversion.nacp:
 	@mkdir -p $(OUT)
-	$(DEVKITPRO)/tools/bin/nacptool --create "ssversion" "wren" "1.8" $@
+	$(DEVKITPRO)/tools/bin/nacptool --create "ssversion" "wren" "1.9" $@
 
 $(OUT)/ssversion.nro: $(OUT)/ssversion.elf $(OUT)/ssversion.nacp
 	$(DEVKITPRO)/tools/bin/elf2nro $< $@ --nacp=$(OUT)/ssversion.nacp
