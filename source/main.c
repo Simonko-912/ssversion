@@ -86,6 +86,11 @@ static bool findSsVersion(FsSaveDataInfo *picked) {
   return found || fallback_done;
 }
 
+// Owner of the ssversion SystemSaveData: SystemUpdate (ns). The info
+// reader reports app=0 for System-type saves, but fsp-srv still matches
+// the owner internally, so retry with the real owner id if needed.
+#define OWNER_TID 0x0100000000000816ULL
+
 static Result openFromInfo(FsFileSystem *fs, const FsSaveDataInfo *info) {
   FsSaveDataAttribute attr;
   memset(&attr, 0, sizeof(attr));
@@ -101,8 +106,38 @@ static Result openFromInfo(FsFileSystem *fs, const FsSaveDataInfo *info) {
          (unsigned long long)info->system_save_data_id,
          (unsigned long long)info->application_id,
          (int)info->save_data_type, (int)info->save_data_rank);
-  return fsOpenSaveDataFileSystemBySystemSaveDataId(
-      fs, (FsSaveDataSpaceId)info->save_data_space_id, &attr);
+
+  FsSaveDataSpaceId space = (FsSaveDataSpaceId)info->save_data_space_id;
+  Result rc = fsOpenSaveDataFileSystemBySystemSaveDataId(fs, space, &attr);
+  if (R_SUCCEEDED(rc)) {
+    printf("opened: bySsid exact\n");
+    return rc;
+  }
+  printf("attempt1 rc=0x%x\n", rc);
+
+  // Retry with the real owner tid (SystemUpdate) + enumerated attrs.
+  attr.application_id = OWNER_TID;
+  rc = fsOpenSaveDataFileSystemBySystemSaveDataId(fs, space, &attr);
+  if (R_SUCCEEDED(rc)) {
+    printf("opened: bySsid owner+0100000000000816\n");
+    return rc;
+  }
+  printf("attempt2 rc=0x%x\n", rc);
+
+  // Last resort: generic open with the same attribute.
+  rc = fsOpenSaveDataFileSystem(fs, space, &attr);
+  if (R_SUCCEEDED(rc)) {
+    printf("opened: generic\n");
+    return rc;
+  }
+  printf("attempt3 rc=0x%x\n", rc);
+
+  // Also try generic open with the reader's original (app=0) attrs.
+  attr.application_id = info->application_id;
+  rc = fsOpenSaveDataFileSystem(fs, space, &attr);
+  if (R_SUCCEEDED(rc)) printf("opened: generic exact\n");
+  else printf("attempt4 rc=0x%x\n", rc);
+  return rc;
 }
 
 static void dumpEntry(FsFileSystem *fs) {
