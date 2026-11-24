@@ -133,17 +133,17 @@ static void terminateNs(void) {
       Result lrc = pmshellLaunchProgram(PmLaunchFlag_None, &loc, &newPid);
       printf("ns launch st=%d: 0x%x\n", (int)storages[a], lrc);
       if (R_FAILED(lrc)) continue;
-      // Verify: pid change via pm info, or ns service connectable.
+      // Verify with pmshellGetProcessId only: it is the query proven
+      // to work from these builds (pmdmnt variant coincided with the
+      // 2145-0024 start crash).
       for (int i = 0; i < 30 && !ready; i++) {
         svcSleepThread(100e6);
         pid = 0;
-        if (R_SUCCEEDED(pmdmntGetProcessId(&pid, NS_TID)) && pid != 0 &&
+        if (R_SUCCEEDED(pmshellGetProcessId(&pid, NS_TID)) && pid != 0 &&
             pid != oldPid) {
           ready = true;
           break;
         }
-        Result nrc = nsInitialize();
-        if (R_SUCCEEDED(nrc)) { nsExit(); ready = true; }
       }
       if (pid == 0 && newPid != 0) pid = newPid;
     }
@@ -316,7 +316,7 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v2.2\n\n");
+  printf("ssversion dumper v2.3\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
