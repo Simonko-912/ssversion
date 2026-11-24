@@ -118,26 +118,35 @@ static void terminateNs(void) {
         pid != oldPid) ready = true;
   }
 
-  Result lrc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
   if (!ready) {
-    NcmProgramLocation loc;
-    memset(&loc, 0, sizeof(loc));
-    loc.program_id = NS_TID;
-    loc.storageID = NcmStorageId_Any;
-    u64 newPid = 0;
-    lrc = pmshellLaunchProgram(PmLaunchFlag_None, &loc, &newPid);
-    printf("ns launch: 0x%x\n", lrc);
-    for (int i = 0; i < 40 && !ready; i++) {
-      svcSleepThread(100e6);
-      pid = 0;
-      if (R_SUCCEEDED(pmshellGetProcessId(&pid, NS_TID)) && pid != 0 &&
-          pid != oldPid) ready = true;
-      else {
+    // ns lives in BuiltInSystem; storage 'Any' may not resolve for a
+    // sysmodule, so try BuiltInSystem first, then Any, then 0.
+    static const u8 storages[3] = { NcmStorageId_BuiltInSystem,
+                                    NcmStorageId_Any,
+                                    NcmStorageId_None };
+    for (int a = 0; a < 3 && !ready; a++) {
+      NcmProgramLocation loc;
+      memset(&loc, 0, sizeof(loc));
+      loc.program_id = NS_TID;
+      loc.storageID = storages[a];
+      u64 newPid = 0;
+      Result lrc = pmshellLaunchProgram(PmLaunchFlag_None, &loc, &newPid);
+      printf("ns launch st=%d: 0x%x\n", (int)storages[a], lrc);
+      if (R_FAILED(lrc)) continue;
+      // Verify: pid change via pm info, or ns service connectable.
+      for (int i = 0; i < 30 && !ready; i++) {
+        svcSleepThread(100e6);
+        pid = 0;
+        if (R_SUCCEEDED(pmdmntGetProcessId(&pid, NS_TID)) && pid != 0 &&
+            pid != oldPid) {
+          ready = true;
+          break;
+        }
         Result nrc = nsInitialize();
         if (R_SUCCEEDED(nrc)) { nsExit(); ready = true; }
       }
+      if (pid == 0 && newPid != 0) pid = newPid;
     }
-    if (pid == 0 && newPid != 0) pid = newPid;
   }
   printf("ns back: %s pid=%llu\n", ready ? "yes" : "no",
          (unsigned long long)pid);
@@ -307,7 +316,7 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v2.1\n\n");
+  printf("ssversion dumper v2.2\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
