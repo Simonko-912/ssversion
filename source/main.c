@@ -116,8 +116,19 @@ static FsFileSystem *mountViaHelper(FsSaveDataInfo *info) {
 
   Result rc = MAKERESULT(Module_Libnx, LibnxError_NotFound);
   Result last = rc;
-  terminateNs();
+
+  // Round 1: mount with ns left running - reading the save usually
+  // works and avoids the HOME-button crash seen after terminating ns.
+  for (int s = 0; s < 2 && R_FAILED(rc); s++) {
+    for (int i = 0; i < 2 && R_FAILED(rc); i++) {
+      rc = fsdevMountSystemSaveData(DEV_NAME, spaces[s], ssids[i], zero);
+      last = rc;
+    }
+  }
+
+  // Still locked? fall back to gag-order's order: kill ns, retry.
   for (int round = 0; round < 10 && R_FAILED(rc); round++) {
+    terminateNs();
     for (int s = 0; s < 2 && R_FAILED(rc); s++) {
       for (int i = 0; i < 2 && R_FAILED(rc); i++) {
         rc = fsdevMountSystemSaveData(DEV_NAME, spaces[s], ssids[i], zero);
@@ -125,7 +136,6 @@ static FsFileSystem *mountViaHelper(FsSaveDataInfo *info) {
       }
     }
     if (R_FAILED(rc)) {
-      terminateNs(); // ns may have re-locked it
       // Once more with the stored attrs from the reader (exact uid).
       if (!findSsVersion(info)) continue;
       rc = fsdevMountSystemSaveData(DEV_NAME,
@@ -236,7 +246,7 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v1.6\n\n");
+  printf("ssversion dumper v1.7\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
