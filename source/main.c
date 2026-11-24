@@ -96,8 +96,25 @@ static bool findSsVersion(FsSaveDataInfo *picked) {
 static void terminateNs(void) {
   Result rc = pmshellInitialize();
   if (R_FAILED(rc)) { printf("pmshell: 0x%x\n", rc); return; }
+
+  // Remember the current pid so we can detect the respawn.
+  u64 oldPid = 0;
+  pmshellGetProcessId(&oldPid, NS_TID);
+
   rc = pmshellTerminateProgram(NS_TID);
   printf("ns terminate: 0x%x\n", rc);
+
+  // Wait until pm hands back a fresh ns pid before we continue. The
+  // HOME-exit handoff talks to ns; if ns is still down/dead when the
+  // handoff runs we get 2011-0301. Gag-Order avoids this by staying
+  // resident as an overlay (no exit handoff at all); we exit, so we
+  // make sure ns is back first.
+  u64 pid = oldPid;
+  for (int i = 0; i < 2000 && pid == oldPid; i++) {
+    pid = 0;
+    if (R_FAILED(pmshellGetProcessId(&pid, NS_TID))) pid = 0;
+  }
+  printf("ns respawned: %llu\n", (unsigned long long)pid);
   pmshellExit();
 }
 
@@ -246,7 +263,7 @@ int main(int argc, char *argv[]) {
   FsSaveDataInfo info;
   memset(&info, 0, sizeof(info));
 
-  printf("ssversion dumper v1.7\n\n");
+  printf("ssversion dumper v1.8\n\n");
 
   FsFileSystem *fs = NULL;
   bool via_fsdev = false;
@@ -262,6 +279,13 @@ int main(int argc, char *argv[]) {
   if (fs) dumpEntry(fs);
   else printf("open failed\n");
 
+  // Release the save before waiting on the user: gag-order order,
+  // commit+unmount first, idle loop after. Keeps HOME-exit clean.
+  if (via_fsdev) {
+    fsdevUnmountDevice(DEV_NAME);
+    via_fsdev = false;
+  }
+
   PadState pad;
   padInitializeDefault(&pad);
   while (appletMainLoop()) {
@@ -269,7 +293,6 @@ int main(int argc, char *argv[]) {
     if (padGetButtonsDown(&pad) & HidNpadButton_Plus) break;
     consoleUpdate(NULL);
   }
-  if (via_fsdev) fsdevUnmountDevice(DEV_NAME);
   consoleExit(NULL);
   return 0;
 }
