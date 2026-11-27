@@ -8,12 +8,14 @@
 #include <string.h>
 
 #include <switch.h>
+#include <switch/services/hid.h>
 
 #define MAXT 128
 
 typedef struct {
   u64 tid;
   char name[64];
+  char ver[16];
   bool req;
 } Title;
 
@@ -26,6 +28,8 @@ static void fmtVer(char *out, size_t n, u32 v) {
   snprintf(out, n, "%u.%u.%u", (v >> 26) & 0x3FFF, (v >> 20) & 0x3F,
            (v >> 14) & 0x3F);
 }
+
+__attribute__((unused)) static void placeholder_(void) { }
 
 static void loadTitles(void) {
   count = 0;
@@ -40,6 +44,7 @@ static void loadTitles(void) {
       Title *t = &titles[count++];
       t->tid = tid;
       t->name[0] = 0;
+      t->ver[0] = 0;
       t->req = false;
 
       // installed version: highest app ContentMeta entry
@@ -58,6 +63,7 @@ static void loadTitles(void) {
         }
       }
       (void)bestIdx;
+      if (best) fmtVer(t->ver, sizeof(t->ver), best);
 
       bool req = false;
       u32 fl = 0;
@@ -103,7 +109,8 @@ static void draw(void) {
   if (cursor >= top + rows) top = cursor - rows + 1;
   for (int r = 0; r < rows && top + r < count; r++) {
     int i = top + r;
-    printf("%c %s%s\n", i == cursor ? '>' : ' ', titles[i].name,
+    printf("%c %s%s%s%s\n", i == cursor ? '>' : ' ', titles[i].name,
+           titles[i].ver[0] ? " v" : "", titles[i].ver,
            titles[i].req ? "  [upd]" : "");
   }
   printf("\nA=clear selected  X=clear all flagged  R/L=page  Plus=exit\n");
@@ -116,25 +123,38 @@ int main(int argc, char *argv[]) {
 
   loadTitles();
 
+  hidInitialize();
   PadState pad;
   padInitializeDefault(&pad);
   bool dirty = true;
   while (appletMainLoop()) {
-    if (dirty) { draw(); consoleUpdate(NULL); dirty = false; }
     padUpdate(&pad);
     u64 d = padGetButtonsDown(&pad);
+    if (dirty) { draw(); consoleUpdate(NULL); dirty = false; }
     if (d & HidNpadButton_Plus) break;
-    if (d & HidNpadButton_Up) { if (cursor) cursor--; dirty = true; }
-    if (d & HidNpadButton_Down) { if (cursor < count - 1) cursor++;
-                                  dirty = true; }
-    if (d & HidNpadButton_L) { cursor -= 20; if (cursor < 0) cursor = 0;
-                              dirty = true; }
-    if (d & HidNpadButton_R) { cursor += 20; if (cursor >= count)
-                              cursor = count ? count - 1 : 0; dirty = true; }
+    if (d & HidNpadButton_Up) {
+      if (cursor) cursor--;
+      dirty = true;
+    }
+    if (d & HidNpadButton_Down) {
+      if (cursor < count - 1) cursor++;
+      dirty = true;
+    }
+    if (d & HidNpadButton_L) {
+      cursor -= 20;
+      if (cursor < 0) cursor = 0;
+      dirty = true;
+    }
+    if (d & HidNpadButton_R) {
+      cursor += 20;
+      if (cursor >= count) cursor = count ? count - 1 : 0;
+      dirty = true;
+    }
     if (d & HidNpadButton_A) { withdrawOne(cursor); dirty = true; }
     if (d & HidNpadButton_X) { withdrawAllFlags(); dirty = true; }
   }
 
+  hidExit();
   nsExit();
   consoleExit(NULL);
   return 0;
