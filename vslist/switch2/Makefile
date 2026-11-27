@@ -22,7 +22,7 @@ $(OUT)/vslist.elf: source/main.c
 
 $(OUT)/vslist.nacp:
 	@mkdir -p $(OUT)
-	$(DEVKITPRO)/tools/bin/nacptool --create "vslist" "wren" "1.0" $@
+	$(DEVKITPRO)/tools/bin/nacptool --create "vslist" "wren" "1.1" $@
 
 $(OUT)/vslist.nro: $(OUT)/vslist.elf $(OUT)/vslist.nacp
 	$(DEVKITPRO)/tools/bin/elf2nro $< $@ --nacp=$(OUT)/vslist.nacp
