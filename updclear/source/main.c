@@ -123,14 +123,16 @@ int main(int argc, char *argv[]) {
 
   loadTitles();
 
-  hidInitialize();
+  padConfigureInput(1, HidNpadStyleSet_NpadStandard);
   PadState pad;
   padInitializeDefault(&pad);
+
   bool dirty = true;
   while (appletMainLoop()) {
     padUpdate(&pad);
     u64 d = padGetButtonsDown(&pad);
-    if (dirty) { draw(); consoleUpdate(NULL); dirty = false; }
+    if (dirty) { draw(); dirty = false; }
+    consoleUpdate(NULL);
     if (d & HidNpadButton_Plus) break;
     if (d & HidNpadButton_Up) {
       if (cursor) cursor--;
@@ -154,7 +156,6 @@ int main(int argc, char *argv[]) {
     if (d & HidNpadButton_X) { withdrawAllFlags(); dirty = true; }
   }
 
-  hidExit();
   nsExit();
   consoleExit(NULL);
   return 0;
