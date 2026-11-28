@@ -21,6 +21,7 @@ typedef struct {
   int nmeta;
   u32 appVer;
   bool req;
+  char dbg[96];   // rc codes from the per-title queries
 } Title;
 
 static Title titles[MAXT];
@@ -54,14 +55,22 @@ static void loadTitles(void) {
       t->req = false;
 
       s32 n = 0;
-      nsCountApplicationContentMeta(tid, &n);
+      Result crc = nsCountApplicationContentMeta(tid, &n);
+      Result lrc = 0;
+      s32 one = 0;
+      if (R_SUCCEEDED(crc) && n > 0) {
+        NsApplicationContentMetaStatus st0;
+        lrc = nsListApplicationContentMetaStatus(tid, 0, &st0, 1, &one);
+      }
+      snprintf(t->dbg, sizeof(t->dbg), "cnt=%d rc=0x%x lrc=0x%x n=%d",
+               n, crc, lrc, one);
       if (n > 4) n = 4;
       for (s32 k = 0; k < n; k++) {
         NsApplicationContentMetaStatus st;
-        s32 one = 0;
+        s32 oo = 0;
         if (R_SUCCEEDED(nsListApplicationContentMetaStatus(tid, k, &st, 1,
-                                                           &one)) &&
-            one == 1) {
+                                                           &oo)) &&
+            oo == 1) {
           char vs[24];
           fmtVer(vs, sizeof(vs), st.version);
           snprintf(t->meta[t->nmeta++], sizeof(t->meta[0]), "%02x:%s",
@@ -74,8 +83,12 @@ static void loadTitles(void) {
 
       bool req = false;
       u32 fl = 0;
-      nsIsApplicationUpdateRequested(tid, &req, &fl);
+      Result frc = nsIsApplicationUpdateRequested(tid, &req, &fl);
       t->req = req || fl != 0;
+      {
+        size_t used = strlen(t->dbg);
+        snprintf(t->dbg + used, sizeof(t->dbg) - used, " f=0x%x", frc);
+      }
 
       static NsApplicationControlData cd;
       u64 have = 0;
@@ -118,8 +131,11 @@ static void runCheck(int i) {
     u8 buf[64];
     if (size > sizeof(buf)) size = sizeof(buf);
     rc = asyncValueGet(&av, buf, size);
-    p += snprintf(p, n - (size_t)(p - diag), " size=%llu get=0x%x\n data:",
+    p += snprintf(p, n - (size_t)(p - diag), " size=%llu get=0x%x\n",
                   (unsigned long long)size, rc);
+    if (R_SUCCEEDED(rc) && size > 0)
+      p += snprintf(p, n - (size_t)(p - diag), "answer=%u\n", buf[0]);
+    p += snprintf(p, n - (size_t)(p - diag), "data:");
     if (R_SUCCEEDED(rc))
       for (u64 k = 0; k < size && k < 24; k++)
         p += snprintf(p, n - (size_t)(p - diag), "%02x ", buf[k]);
@@ -155,7 +171,7 @@ static void draw(void) {
   consoleClear();
   int flagged = 0;
   for (int i = 0; i < count; i++) flagged += titles[i].req;
-  printf("updclear v1.3 - %d titles, %d flagged\n\n", count, flagged);
+  printf("updclear v1.4 - %d titles, %d flagged\n\n", count, flagged);
 
   int rows = 14;
   if (cursor < top) top = cursor;
@@ -170,7 +186,8 @@ static void draw(void) {
 
   if (cursor < count) {
     Title *t = &titles[cursor];
-    printf("\nmeta:");
+    printf("%s\n", t->dbg);
+    printf("meta:");
     for (int k = 0; k < t->nmeta; k++) printf(" %s", t->meta[k]);
     if (!t->nmeta) printf(" none");
     printf("\n%s", diag);

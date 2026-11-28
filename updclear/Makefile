@@ -20,7 +20,7 @@ $(OUT)/updclear.elf: source/main.c
 
 $(OUT)/updclear.nacp:
 	@mkdir -p $(OUT)
-	$(DEVKITPRO)/tools/bin/nacptool --create "updclear" "wren" "1.3" $@
+	$(DEVKITPRO)/tools/bin/nacptool --create "updclear" "wren" "1.4" $@
 
 $(OUT)/updclear.nro: $(OUT)/updclear.elf $(OUT)/updclear.nacp
 	$(DEVKITPRO)/tools/bin/elf2nro $< $@ --nacp=$(OUT)/updclear.nacp
